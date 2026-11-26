@@ -6,7 +6,8 @@ import { useElementHole } from '../hooks/useViewportOverlay';
 /**
  * Appears once a new version has been downloaded in the background and offers
  * to restart into it. "Later" hides it until the next launch; the update stays
- * downloaded and is also offered in Settings → About.
+ * downloaded, is also offered in Settings → About, and installs on its own
+ * when Serica is closed.
  */
 export const UpdateNotice: React.FC = () => {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
@@ -33,7 +34,7 @@ export const UpdateNotice: React.FC = () => {
       <div className="update-notice-body">
         <p className="update-notice-title">Serica {version} is ready</p>
         <p className="update-notice-text">
-          {installing ? 'Installing… Serica will reopen when it’s done.' : 'Restart to update. Your tabs will be right where you left them.'}
+          {installing ? 'Installing… Serica will reopen when it’s done.' : 'Restart now, or it installs when you close Serica. Your tabs will be right where you left them.'}
         </p>
       </div>
       <div className="update-notice-actions">
