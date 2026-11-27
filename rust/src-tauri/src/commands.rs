@@ -404,7 +404,7 @@ pub async fn set_viewport_hole(
     if !rect.iter().all(|v| v.is_finite()) || id.len() > 64 {
         return Err("bad hole".into());
     }
-    TabHost::set_hole(
+    let seq = TabHost::set_hole(
         app.inner(),
         id,
         h(rect),
@@ -414,16 +414,10 @@ pub async fn set_viewport_hole(
         remove.unwrap_or(false),
         lead.filter(|l| l.is_finite()).unwrap_or(0.0).clamp(-100.0, 100.0),
     );
-    // Window regions are set on the main thread, in order: resolve only once
-    // everything queued so far has run, so "ready" means the page really is
-    // cut (it can be busy for tens of ms, e.g. while a page loads).
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if app.handle.run_on_main_thread(move || {
-        let _ = tx.send(());
-    }).is_ok()
-    {
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx).await;
-    }
+    // Resolve once the page really is cut (the clip worker applied it), so
+    // "ready" means UI under the hole is visible.
+    let app = app.inner().clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || TabHost::wait_clip(&app, seq, std::time::Duration::from_millis(500))).await;
     Ok(())
 }
 
@@ -483,6 +477,8 @@ pub fn ui_cursor(app: State<'_, Shared>) -> Option<[f64; 3]> {
 #[tauri::command]
 pub async fn viewport_capture(app: State<'_, Shared>) -> R<Option<String>> {
     let app = app.inner().clone();
+    // The tab being captured (read before: a switch may happen meanwhile).
+    let active_id = app.store.lock().active_tab_id.clone();
     let mut image = None;
     #[cfg(windows)]
     if let Some(wv) = TabHost::active_webview(&app) {
@@ -490,12 +486,10 @@ pub async fn viewport_capture(app: State<'_, Shared>) -> R<Option<String>> {
             image = await_cb(|done| crate::webview_win::capture(&wv, done)).await.flatten();
         }
     }
-    // Read the id first: never hold the store lock while taking the host lock.
-    let active_id = app.store.lock().active_tab_id.clone();
-    if let (Some(img), Some(id)) = (&image, active_id) {
-        app.host.lock().previews.insert(id, img.clone());
-    }
-    Ok(image)
+    Ok(match (image, active_id) {
+        (Some(img), Some(id)) => Some(app.previews.put(&id, img)),
+        _ => None,
+    })
 }
 
 /// Hides the native webview so UI overlays can cover the page. With `capture`
@@ -504,6 +498,7 @@ pub async fn viewport_capture(app: State<'_, Shared>) -> R<Option<String>> {
 #[tauri::command]
 pub async fn viewport_freeze(capture: Option<bool>, app: State<'_, Shared>) -> R<Option<String>> {
     let app = app.inner().clone();
+    let active_id = app.store.lock().active_tab_id.clone();
     let mut image = None;
     #[cfg(windows)]
     if capture.unwrap_or(true) {
@@ -515,12 +510,10 @@ pub async fn viewport_freeze(capture: Option<bool>, app: State<'_, Shared>) -> R
     }
     let a2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || TabHost::set_visible(&a2, false)).await.map_err(|e| e.to_string())?;
-    // Read the id first: never hold the store lock while taking the host lock.
-    let active_id = app.store.lock().active_tab_id.clone();
-    if let (Some(img), Some(id)) = (&image, active_id) {
-        app.host.lock().previews.insert(id, img.clone());
-    }
-    Ok(image)
+    Ok(match (image, active_id) {
+        (Some(img), Some(id)) => Some(app.previews.put(&id, img)),
+        _ => None,
+    })
 }
 
 #[tauri::command]
@@ -577,19 +570,17 @@ pub async fn capture_tab_preview(tab_id: String, app: State<'_, Shared>) -> R<Op
         if visible {
             if let Some(wv) = TabHost::webview(&app, &tab_id) {
                 if let Some(Some(img)) = await_cb(|done| crate::webview_win::capture(&wv, done)).await {
-                    app.host.lock().previews.insert(tab_id.clone(), img.clone());
-                    return Ok(Some(img));
+                    return Ok(Some(app.previews.put(&tab_id, img)));
                 }
             }
         }
     }
-    let preview = app.host.lock().previews.get(&tab_id).cloned();
-    Ok(preview)
+    Ok(app.previews.url(&tab_id))
 }
 
 #[tauri::command]
 pub async fn get_tab_preview(tab_id: String, app: State<'_, Shared>) -> R<Option<String>> {
-    Ok(app.host.lock().previews.get(&tab_id).cloned())
+    Ok(app.previews.url(&tab_id))
 }
 
 #[tauri::command]
@@ -602,47 +593,33 @@ pub async fn open_devtools(app: State<'_, Shared>) -> R<()> {
 
 // ------------------------------------------------------------------ media
 
-const MEDIA_STATE_JS: &str = r#"(() => {
-  const els = Array.from(document.querySelectorAll('video, audio'));
-  const m = els.find((e) => !e.paused && !e.ended) || els.find((e) => e.currentTime > 0) || null;
-  if (!m) return null;
-  const d = m.duration;
-  const live = d === Infinity || isNaN(d);
-  return { hasVideo: m.tagName === 'VIDEO', isPlaying: !m.paused && !m.ended, currentTime: m.currentTime || 0,
-           duration: live ? 0 : (d || 0), volume: m.muted ? 0 : (m.volume ?? 1), tabTitle: document.title || 'Media',
-           inPip: !!document.pictureInPictureElement };
-})()"#;
-
 #[tauri::command]
 pub async fn get_media_state(tab_id: String, app: State<'_, Shared>) -> R<Option<Value>> {
     #[cfg(windows)]
     if let Some(wv) = TabHost::webview(app.inner(), &tab_id) {
-        let v = await_cb(|done| crate::webview_win::eval(&wv, MEDIA_STATE_JS.into(), done)).await.flatten();
-        return Ok(v.filter(|v| !v.is_null()));
+        let js = crate::tabhost::media_state_js();
+        let v = await_cb(|done| crate::webview_win::media_eval(&wv, tab_id, js, true, done)).await.flatten();
+        return Ok(v.filter(|v| v.is_object()));
     }
     #[cfg(not(windows))]
     let _ = (tab_id, app);
     Ok(None)
 }
 
+/// Mini player controls. They act on the playing media element wherever it
+/// is: in the page, in a web component, or in a player embedded from another
+/// site (see `webview_win::media_eval`).
 #[tauri::command]
 pub async fn media_control(tab_id: String, action: String, value: Option<f64>, app: State<'_, Shared>) -> R<()> {
     let Some(wv) = TabHost::webview(app.inner(), &tab_id) else { return Ok(()) };
-    let pick = "const m = Array.from(document.querySelectorAll('video, audio')).find((e) => !e.paused) || document.querySelector('video, audio'); if (!m) return;";
-    let body = match (action.as_str(), value) {
-        ("play", _) => "m.play();".to_string(),
-        ("pause", _) => "m.pause();".to_string(),
-        ("toggle", _) => "if (m.paused) m.play(); else m.pause();".to_string(),
-        ("pip", _) => {
-            let _ = wv.eval(crate::tabhost::PIP_ENTER_JS);
-            return Ok(());
-        }
-        ("exit-pip", _) => {
-            let _ = wv.eval(crate::tabhost::PIP_EXIT_JS);
-            return Ok(());
-        }
-        ("seek", Some(v)) if v.is_finite() => format!("m.currentTime = {};", v.max(0.0)),
-        ("volume", Some(v)) if v.is_finite() => format!("m.muted = false; m.volume = {};", v.clamp(0.0, 1.0)),
+    let js = match (action.as_str(), value) {
+        ("play", _) => crate::tabhost::media_action_js("m.play();"),
+        ("pause", _) => crate::tabhost::media_action_js("m.pause();"),
+        ("toggle", _) => crate::tabhost::media_action_js("if (m.paused) m.play(); else m.pause();"),
+        ("pip", _) => crate::tabhost::pip_enter_js(),
+        ("exit-pip", _) => crate::tabhost::PIP_EXIT_JS.to_string(),
+        ("seek", Some(v)) if v.is_finite() => crate::tabhost::media_action_js(&format!("m.currentTime = {};", v.max(0.0))),
+        ("volume", Some(v)) if v.is_finite() => crate::tabhost::media_action_js(&format!("m.muted = false; m.volume = {};", v.clamp(0.0, 1.0))),
         ("mute", _) => {
             #[cfg(windows)]
             crate::webview_win::set_muted(&wv, true);
@@ -655,16 +632,32 @@ pub async fn media_control(tab_id: String, action: String, value: Option<f64>, a
         }
         _ => return Err("unknown media action".into()),
     };
-    let _ = wv.eval(format!("(() => {{ {pick} {body} }})()"));
+    #[cfg(windows)]
+    crate::webview_win::media_eval(&wv, tab_id, js, true, |_| {});
+    #[cfg(not(windows))]
+    let _ = (wv.eval(js), tab_id);
     Ok(())
 }
 
 // ------------------------------------------------------------------ spaces & profiles
 
+/// `keep_ui_focus`: the switch was made from the open sidebar, so the page
+/// that comes on screen leaves focus in the UI (see `TabHost::keep_ui_focus`).
 #[tauri::command]
-pub async fn select_space(space_id: String, app: State<'_, Shared>) -> R<()> {
+pub async fn select_space(space_id: String, keep_ui_focus: Option<bool>, app: State<'_, Shared>) -> R<()> {
+    if keep_ui_focus == Some(true) {
+        app.host.lock().keep_ui_focus = true;
+    }
     app.mutate(|s| s.activate_space(&space_id));
     Ok(())
+}
+
+/// Ends a `select_space(.., keep_ui_focus)` session: pages take focus as usual
+/// again, and the page on screen gets it now unless `focus` is false (the
+/// UI has moved on to something else that has focus, like the address bar).
+#[tauri::command]
+pub fn focus_page(focus: Option<bool>, app: State<'_, Shared>) {
+    TabHost::focus_page(app.inner(), focus.unwrap_or(true));
 }
 
 #[tauri::command]
@@ -1306,6 +1299,26 @@ pub async fn list_downloads(app: State<'_, Shared>) -> R<Vec<crate::downloads::D
     Ok(app.downloads.list())
 }
 
+/// Starts dragging finished downloads out of the Downloads panel as files
+/// (to a folder, the desktop, or a web page). Only files Serica downloaded
+/// and that still exist can be dragged.
+#[tauri::command]
+pub async fn start_download_drag(ids: Vec<String>, app: State<'_, Shared>) -> R<bool> {
+    let paths: Vec<std::path::PathBuf> = ids
+        .iter()
+        .filter_map(|id| app.downloads.get(id))
+        .filter(|d| d.state == crate::downloads::DownloadState::Completed)
+        .map(|d| std::path::PathBuf::from(d.path))
+        .filter(|p| p.is_file())
+        .collect();
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    crate::dragdrop_win::start_file_drag(app.inner(), paths);
+    Ok(true)
+}
+
 /// `pause` | `resume` | `cancel` | `open` | `show` | `remove` | `retry`.
 #[tauri::command]
 pub async fn download_action(id: String, action: String, app: State<'_, Shared>) -> R<bool> {
@@ -1449,6 +1462,23 @@ pub fn get_update_status(app: State<'_, Shared>) -> crate::updater::UpdateStatus
 pub async fn check_for_update(app: State<'_, Shared>) -> R<crate::updater::UpdateStatus> {
     let handle = app.handle.clone();
     Ok(crate::updater::check(&handle).await)
+}
+
+#[tauri::command]
+pub fn get_ui_patch_status() -> crate::ui_patch::UiPatchStatus {
+    crate::ui_patch::status()
+}
+
+/// Called once the UI has rendered: the UI patch in use works.
+#[tauri::command]
+pub fn confirm_ui_patch() {
+    crate::ui_patch::confirm()
+}
+
+/// Switches to the downloaded UI fix; the UI reloads right after.
+#[tauri::command]
+pub fn apply_ui_patch() -> R<()> {
+    crate::ui_patch::apply()
 }
 
 #[tauri::command]

@@ -17,14 +17,21 @@ mod local_ai;
 mod mcp;
 mod mcp_http;
 mod model;
+mod perf;
+mod previews;
 mod settings;
 mod shields;
 mod store;
 mod tabhost;
+mod ui_patch;
 mod updater;
 mod vpn;
 mod widgets;
 mod window_state;
+#[cfg(windows)]
+mod clip_win;
+#[cfg(windows)]
+mod edge_watch;
 #[cfg(windows)]
 mod webview_win;
 #[cfg(windows)]
@@ -60,6 +67,10 @@ pub fn run() {
     #[cfg(windows)]
     migrate_legacy_data();
 
+    // Serve a downloaded UI fix (see ui_patch.rs) instead of the built-in UI.
+    let mut context = tauri::generate_context!();
+    ui_patch::install(&mut context);
+
     let app = tauri::Builder::default()
         // Must be first: a second launch (e.g. double-clicking a PDF while
         // Serica is open) hands its arguments to this instance and exits.
@@ -80,7 +91,13 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Pictures chosen for the new-tab background.
         .register_uri_scheme_protocol("sericabg", |ctx, request| backgrounds::serve(ctx.app_handle(), &request))
+        // Page captures: only the app's own UI may read them, never a web page.
+        .register_uri_scheme_protocol("sericacap", |ctx, request| match ctx.app_handle().try_state::<app::Shared>() {
+            Some(app) if ctx.webview_label() == "main" => app.previews.serve(&request),
+            _ => tauri::http::Response::builder().status(404).body(Vec::new()).unwrap_or_default(),
+        })
         .setup(|app| {
+            perf::start(app.handle().clone());
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -89,6 +106,8 @@ pub fn run() {
                 window_state::attach(&window, data_dir.join("window.json"));
             }
             let shared = app::App::new(app.handle().clone(), data_dir);
+            #[cfg(windows)]
+            edge_watch::start(shared.clone());
             let scale = shared.settings().text_scale;
             if (scale - 1.0).abs() > 0.001 {
                 commands::apply_ui_zoom(&shared, scale);
@@ -101,10 +120,14 @@ pub fn run() {
             }
             app.manage(shared);
             updater::start(app.handle().clone());
+            ui_patch::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_browser_state,
+            commands::get_ui_patch_status,
+            commands::confirm_ui_patch,
+            commands::apply_ui_patch,
             commands::page_menu_select,
             commands::widget_github,
             commands::widget_geocode,
@@ -152,6 +175,7 @@ pub fn run() {
             commands::get_media_state,
             commands::media_control,
             commands::select_space,
+            commands::focus_page,
             commands::create_space,
             commands::delete_space,
             commands::update_space,
@@ -199,6 +223,7 @@ pub fn run() {
             commands::passwords_list,
             commands::list_downloads,
             commands::download_action,
+            commands::start_download_drag,
             commands::clear_downloads,
             commands::open_downloads_folder,
             commands::list_extensions,
@@ -230,7 +255,7 @@ pub fn run() {
             browser_import::import_from_browser,
             browser_import::import_passwords_file,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building serica browser");
 
     app.run(|handle, event| {

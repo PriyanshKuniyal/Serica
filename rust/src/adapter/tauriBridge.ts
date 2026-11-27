@@ -17,6 +17,14 @@ export interface UpdateStatus {
   lastChecked?: number | null;
 }
 
+export interface UiPatchStatus {
+  /** Build of the UI fix in use (0: the UI built into the app). */
+  activeBuild: number;
+  /** A newer fix, downloaded and waiting for a reload. */
+  readyBuild?: number | null;
+  notes?: string | null;
+}
+
 /** Subscribes to a backend event; safe to unsubscribe before `listen` resolves. */
 function on<T>(event: string, callback: (payload: T) => void): Unsubscribe {
   let unlisten: UnlistenFn | undefined;
@@ -91,7 +99,10 @@ export const tauriBridge = {
   togglePinTab: (tabId: string) => invoke<void>('toggle_pin_tab', { tabId }),
   toggleSleepTab: (tabId: string) => invoke<void>('toggle_sleep_tab', { tabId }),
   reorderTabs: (draggedTabId: string, targetTabId: string) => invoke<void>('reorder_tabs', { draggedTabId, targetTabId }),
-  selectSpace: (spaceId: string) => invoke<void>('select_space', { spaceId }),
+  /** `keepUiFocus`: made from the open sidebar; the page shown leaves focus in the UI until `focusPage`. */
+  selectSpace: (spaceId: string, keepUiFocus?: boolean) => invoke<void>('select_space', { spaceId, keepUiFocus: keepUiFocus ?? null }),
+  /** Ends a `keepUiFocus` switch; the page on screen gets focus unless `focus` is false. */
+  focusPage: (focus = true) => invoke<void>('focus_page', { focus }),
   createSpace: (name: string, color?: string, profileId?: string) =>
     invoke<any>('create_space', { name, color: color ?? null, profileId: profileId ?? null }),
   deleteSpace: (spaceId: string) => invoke<any>('delete_space', { spaceId }),
@@ -171,6 +182,8 @@ export const tauriBridge = {
   // Downloads
   listDownloads: () => invoke<any[]>('list_downloads'),
   downloadAction: (id: string, action: string) => invoke<boolean>('download_action', { id, action }),
+  /** Drags finished downloads out as files (to a folder, the desktop or a page). */
+  startDownloadDrag: (ids: string[]) => invoke<boolean>('start_download_drag', { ids }),
   clearDownloads: () => invoke<any[]>('clear_downloads'),
   openDownloadsFolder: () => invoke<void>('open_downloads_folder'),
   openFile: () => invoke<void>('open_file'),
@@ -193,6 +206,10 @@ export const tauriBridge = {
   getUpdateStatus: () => invoke<UpdateStatus>('get_update_status'),
   checkForUpdate: () => invoke<UpdateStatus>('check_for_update'),
   installUpdate: () => invoke<void>('install_update'),
+  getUiPatchStatus: () => invoke<UiPatchStatus>('get_ui_patch_status'),
+  confirmUiPatch: () => invoke<void>('confirm_ui_patch'),
+  applyUiPatch: () => invoke<void>('apply_ui_patch'),
+  onUiPatch: (cb: (status: UiPatchStatus) => void) => on('serica:ui-patch', cb),
 
   // Events from the backend
   onStateUpdate: (cb: (state: any) => void) => on('serica:state-update', cb),
@@ -221,6 +238,10 @@ export const tauriBridge = {
   onZoomUpdated: (cb: (data: { tabId?: string; zoomFactor: number }) => void) => on('serica:zoom-updated', cb),
   onFindResult: (cb: (r: { tabId: string; activeMatch: number; totalMatches: number }) => void) => on('serica:find-result', cb),
   onPageColor: (cb: (r: { tabId: string; themeColor: string | null }) => void) => on('serica:page-color', cb),
+  /** The pointer is nearing a window edge over a live page (`left`, `top` or `right`). */
+  onEdgeApproach: (cb: (edge: 'left' | 'top' | 'right') => void) => on('serica:edge-approach', cb),
+  /** The page on screen settled after scrolling (tab id). */
+  onPageSettled: (cb: (tabId: string) => void) => on('serica:page-settled', cb),
   widgetGithub: (user: string) => invoke<GithubContributions>('widget_github', { user }),
   widgetGeocode: (query: string) => invoke<GeoPlace>('widget_geocode', { query }),
   widgetWeather: (lat: number, lon: number, fahrenheit: boolean) =>

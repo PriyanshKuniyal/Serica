@@ -259,6 +259,8 @@ export interface SericaAPI {
   findInPage?: (query: string | null, options?: { forward?: boolean; findNext?: boolean }) => Promise<void>;
   onFindResult?: (cb: (r: { tabId: string; activeMatch: number; totalMatches: number }) => void) => () => void;
   onPageColor?: (cb: (r: { tabId: string; themeColor: string | null }) => void) => () => void;
+  onEdgeApproach?: (cb: (edge: 'left' | 'top' | 'right') => void) => () => void;
+  onPageSettled?: (cb: (tabId: string) => void) => () => void;
   /** New-tab widget data (fetched by the backend, straight from the source). */
   widgetGithub?: (user: string) => Promise<GithubContributions>;
   widgetGeocode?: (query: string) => Promise<GeoPlace>;
@@ -281,6 +283,7 @@ export interface SericaAPI {
   mcpRegenerateToken?: () => Promise<{ enabled: boolean; running: boolean; port: number; url: string; token: string; error?: string | null }>;
   listDownloads?: () => Promise<DownloadItem[]>;
   downloadAction?: (id: string, action: DownloadAction) => Promise<boolean>;
+  startDownloadDrag?: (ids: string[]) => Promise<boolean>;
   clearDownloads?: () => Promise<DownloadItem[]>;
   openDownloadsFolder?: () => Promise<void>;
   /** Native "Open file" picker; chosen files (PDFs…) open in new tabs. */
@@ -322,7 +325,8 @@ export interface SericaAPI {
   selectTab: (tabId: string) => Promise<void>;
   togglePinTab: (tabId: string) => Promise<void>;
   toggleSleepTab: (tabId: string) => Promise<void>;
-  selectSpace: (spaceId: string) => Promise<void>;
+  selectSpace: (spaceId: string, keepUiFocus?: boolean) => Promise<void>;
+  focusPage?: (focus?: boolean) => Promise<void>;
   createSpace?: (name: string, color?: string, profileId?: string) => Promise<Space | null>;
   deleteSpace?: (spaceId: string) => Promise<IpcResult>;
   updateSpace?: (spaceId: string, patch: SpacePatch) => Promise<IpcResult<{ space: Space }>>;

@@ -51,30 +51,99 @@ const TRIM_AFTER_LOW: std::time::Duration = std::time::Duration::from_secs(30);
 const SUSPEND_AFTER_LOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const LOW_MEMORY_LOAD: u32 = 75;
 
-/// Puts the largest playing video into native picture-in-picture.
-pub const PIP_ENTER_JS: &str = r#"(() => {
-  if (document.pictureInPictureElement || !document.pictureInPictureEnabled) return false;
-  const vs = Array.from(document.querySelectorAll('video')).filter((v) => !v.paused && !v.ended && v.readyState >= 2 && !v.disablePictureInPicture);
+/// Finds the page's media elements: in the document, in open shadow roots
+/// (players built as web components) and in same-origin frames. Players in
+/// frames from another site are reached through their own DevTools session
+/// (see `webview_win::media_eval`), where this runs again.
+const MEDIA_FIND_JS: &str = r#"const __sericaMedia = () => {
+  const quick = Array.from(document.querySelectorAll('video, audio'));
+  if (quick.length) return quick;
+  const out = [], seen = new Set();
+  const walk = (root, depth) => {
+    if (!root || depth > 5 || seen.has(root)) return;
+    seen.add(root);
+    let all;
+    try { all = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const n of all) {
+      if (n.tagName === 'VIDEO' || n.tagName === 'AUDIO') out.push(n);
+      if (n.shadowRoot) walk(n.shadowRoot, depth + 1);
+      if (n.tagName === 'IFRAME' || n.tagName === 'FRAME') { try { if (n.contentDocument) walk(n.contentDocument, depth + 1); } catch (e) {} }
+    }
+  };
+  walk(document, 0);
+  return out;
+};"#;
+
+/// Moves the largest playing video into a picture-in-picture window (the
+/// mini player that keeps playing when its tab is left). Resolves true once
+/// this document shows one (false when it has no such video, or the browser
+/// refused). Sites that set `disablePictureInPicture` are overridden: the
+/// user asked for the mini player.
+pub fn pip_enter_js() -> String {
+    format!(
+        r#"(async () => {{
+  {MEDIA_FIND_JS}
+  if (document.pictureInPictureElement) return true;
+  if (!document.pictureInPictureEnabled) return false;
+  const vs = __sericaMedia().filter((v) => v.tagName === 'VIDEO' && !v.paused && !v.ended && v.readyState >= 2);
   if (!vs.length) return false;
   vs.sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight);
   const v = vs[0];
   if (v.clientWidth * v.clientHeight < 200 * 112) return false;
-  v.requestPictureInPicture().catch(() => {});
-  return true;
-})()"#;
+  if (v.disablePictureInPicture) v.disablePictureInPicture = false;
+  try {{ await v.requestPictureInPicture(); return true; }} catch (e) {{ return false; }}
+}})()"#
+    )
+}
 
 /// Brings a picture-in-picture video back into its page. Runs right as the tab
-/// is shown, so it waits until the document is actually visible.
+/// is shown, so it waits until the document is actually visible. True when
+/// this document had one.
 pub const PIP_EXIT_JS: &str = r#"(() => {
+  if (!document.pictureInPictureElement) return false;
   const exit = () => { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {}); };
-  if (document.visibilityState === 'visible') { exit(); return; }
+  if (document.visibilityState === 'visible') { exit(); return true; }
   const onVisible = () => {
     if (document.visibilityState !== 'visible') return;
     document.removeEventListener('visibilitychange', onVisible);
     exit();
   };
   document.addEventListener('visibilitychange', onVisible);
+  return true;
 })()"#;
+
+/// The playing (or last played) media element's state for the mini player
+/// bar, or null when this document has none.
+pub fn media_state_js() -> String {
+    format!(
+        r#"(() => {{
+  {MEDIA_FIND_JS}
+  const els = __sericaMedia();
+  const m = els.find((e) => !e.paused && !e.ended) || els.find((e) => e.currentTime > 0) || null;
+  if (!m) return null;
+  const d = m.duration;
+  const live = d === Infinity || isNaN(d);
+  return {{ hasVideo: m.tagName === 'VIDEO', isPlaying: !m.paused && !m.ended, currentTime: m.currentTime || 0,
+           duration: live ? 0 : (d || 0), volume: m.muted ? 0 : (m.volume ?? 1), tabTitle: (window.top === window ? document.title : '') || 'Media',
+           inPip: !!document.pictureInPictureElement }};
+}})()"#
+    )
+}
+
+/// Runs `body` (which uses `m`) on the playing media element; true when this
+/// document had one.
+pub fn media_action_js(body: &str) -> String {
+    format!(
+        r#"(() => {{
+  {MEDIA_FIND_JS}
+  const els = __sericaMedia();
+  const m = els.find((e) => !e.paused) || els.find((e) => e.currentTime > 0) || els[0];
+  if (!m) return false;
+  {body}
+  return true;
+}})()"#
+    )
+}
 
 /// A rectangle of UI (CSS px, window coordinates) that shows through the page.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,7 +157,7 @@ pub struct Hole {
 }
 
 impl Hole {
-    fn lerp(a: Hole, b: Hole, p: f64) -> Hole {
+    pub(crate) fn lerp(a: Hole, b: Hole, p: f64) -> Hole {
         let l = |x: f64, y: f64| x + (y - x) * p;
         Hole { x: l(a.x, b.x), y: l(a.y, b.y), w: l(a.w, b.w), h: l(a.h, b.h), r: l(a.r, b.r) }
     }
@@ -119,14 +188,17 @@ pub fn cubic_bezier(e: [f64; 4], x: f64) -> f64 {
 pub struct TabHost {
     pub views: HashMap<String, TabView>,
     /// UI regions cut out of the page (sidebar, dock, menus), by owner id.
-    pub holes: HashMap<String, Hole>,
-    hole_gen: HashMap<String, u64>,
+    /// Applies the holes to the page windows (off the main thread).
+    #[cfg(windows)]
+    pub clipper: std::sync::Arc<crate::clip_win::Clipper>,
     pub bounds: Option<Bounds>,
     /// False while a UI overlay covers the viewport.
     pub visible: bool,
     pub active: Option<String>,
-    pub previews: HashMap<String, String>,
     pub assistant: Option<(Webview, Bounds)>,
+    /// Last page of each assistant (by host), so switching assistants or
+    /// closing the panel returns to the same chat instead of its home page.
+    assistant_last: HashMap<String, url::Url>,
     data_root: PathBuf,
     proxy_port: Option<u16>,
     /// Network setup the current page webviews were created with:
@@ -143,6 +215,11 @@ pub struct TabHost {
     /// Profiles whose pages are kept closed for now (their password store is
     /// being written by an import).
     paused: std::collections::HashSet<String>,
+    /// While set, pages that come on screen leave keyboard focus in the UI. Set for a space switch made from the open sidebar, where the
+    /// pointer is still in use: a focused page takes the touchpad's scroll
+    /// and swipe input, so the sidebar could not swipe again until clicked.
+    /// The UI hands focus to the page (`focus_page`) once the sidebar closes.
+    pub keep_ui_focus: bool,
 }
 
 /// Two-finger horizontal touchpad swipe over a page goes back/forward, when
@@ -213,6 +290,13 @@ pub const PAGE_SCRIPT: &str = r#"(() => {
   if (window.top !== window || window.__sericaPage) return;
   Object.defineProperty(window, '__sericaPage', { value: true });
   const post = (m) => { try { window.chrome.webview.postMessage(JSON.stringify(Object.assign({ __serica: 1 }, m))); } catch (e) {} };
+  // Scrolling settled: the app refreshes its capture of the page, which it
+  // draws under panels (sidebar, top bar) sliding over the page.
+  let settle = 0;
+  addEventListener('scroll', () => {
+    clearTimeout(settle);
+    settle = setTimeout(() => { if (document.visibilityState === 'visible') post({ t: 'settled' }); }, 300);
+  }, { passive: true, capture: true });
   const seenC = new Set(), seenI = new Set();
   let pendC = [], pendI = [], timer = 0;
   const flush = () => { timer = 0; if (pendC.length || pendI.length) { post({ t: 'cosmetic', classes: pendC, ids: pendI }); pendC = []; pendI = []; } };
@@ -337,13 +421,13 @@ impl TabHost {
     pub fn new(data_root: PathBuf, proxy_port: Option<u16>, net: (bool, bool), block_3pc: bool) -> Self {
         Self {
             views: HashMap::new(),
-            holes: HashMap::new(),
-            hole_gen: HashMap::new(),
+            #[cfg(windows)]
+            clipper: crate::clip_win::Clipper::new(),
             bounds: None,
             visible: true,
             active: None,
-            previews: HashMap::new(),
             assistant: None,
+            assistant_last: HashMap::new(),
             data_root,
             proxy_port,
             net,
@@ -351,6 +435,7 @@ impl TabHost {
             create_failures: 0,
             creating: std::collections::HashSet::new(),
             paused: std::collections::HashSet::new(),
+            keep_ui_focus: false,
         }
     }
 
@@ -460,6 +545,7 @@ impl TabHost {
     /// the host lock held, or both threads wait on each other forever.
     fn build(app: &Shared, tab_id: &str, profile: &str, p: PendingView) -> Option<Webview> {
         let PendingView { window, builder, bounds, url: parsed } = p;
+        let _perf = crate::perf::span("build_webview(any thread)");
         match window.add_child(builder, LogicalPosition::new(bounds.x, bounds.y), LogicalSize::new(bounds.w.max(1.0), bounds.h.max(1.0))) {
             Ok(wv) => {
                 #[cfg(windows)]
@@ -484,6 +570,7 @@ impl TabHost {
 
     /// Brings native webviews in line with the store.
     pub fn reconcile(app: &Shared) {
+        let _perf = crate::perf::span("reconcile");
         struct Want {
             url: String,
             live: bool,
@@ -528,19 +615,17 @@ impl TabHost {
             .collect();
         for id in stale {
             if let Some(v) = host.views.remove(&id) {
+                #[cfg(windows)]
+                host.clipper.forget(v.webview.label());
                 let _ = v.webview.close();
             }
             if !wants.contains_key(&id) {
-                host.previews.remove(&id);
+                app.previews.remove(&id);
             }
         }
 
         let previous = host.active.clone();
         host.active = active.clone();
-        #[cfg(windows)]
-        let clip = Self::clip_rects(&host, text_scale);
-        #[cfg(not(windows))]
-        let _ = text_scale;
         let visible = host.visible;
         let bounds = host.bounds;
         let mut previews_to_capture = Vec::new();
@@ -552,6 +637,14 @@ impl TabHost {
         let active_shown_before = active.as_ref().and_then(|id| host.views.get(id)).is_some_and(|v| v.shown);
         for (id, v) in host.views.iter_mut() {
             let should_show = visible && Some(id) == active.as_ref();
+            // Leaving a playing video for another tab: keep watching it in a
+            // mini player (also when the page was under a dialog at the time,
+            // e.g. switching from the command bar). Not when UI only covers
+            // the page for a moment: the tab is still the one in use.
+            #[cfg(windows)]
+            if auto_pip && previous.as_ref() == Some(id) && active.as_ref() != Some(id) && wants.get(id).map(|w| w.media).unwrap_or(false) {
+                Self::pip_on_leave(app, id.clone(), v.webview.clone());
+            }
             if should_show {
                 if let Some(b) = bounds {
                     Self::apply_bounds(&v.webview, b);
@@ -564,23 +657,18 @@ impl TabHost {
                         focus_page = Some(v.webview.clone());
                     }
                     #[cfg(windows)]
-                    crate::webview_win::set_clip(&v.webview, clip.clone());
-                    #[cfg(windows)]
                     crate::webview_win::set_background(&v.webview, false);
                     let _ = v.webview.show();
                     v.shown = true;
                     v.hidden_at = None;
                     // Returning to a tab brings its mini-player video back into the page.
-                    let _ = v.webview.eval(PIP_EXIT_JS);
+                    #[cfg(windows)]
+                    crate::webview_win::media_eval(&v.webview, id.clone(), PIP_EXIT_JS.to_string(), false, |_| {});
                 }
             } else if v.shown {
                 // Snapshot the page we're leaving for hover previews.
                 if previous.as_ref() == Some(id) {
                     previews_to_capture.push((id.clone(), v.webview.clone()));
-                    // Leaving a playing video: keep watching it in a mini player.
-                    if auto_pip && wants.get(id).map(|w| w.media).unwrap_or(false) {
-                        let _ = v.webview.eval(PIP_ENTER_JS);
-                    }
                 }
                 let _ = v.webview.hide();
                 v.shown = false;
@@ -593,6 +681,16 @@ impl TabHost {
         // Switched to a tab without a page on screen (new tab page, or a page
         // still being built): the UI takes focus so its shortcuts work.
         let focus_ui = visible && focus_page.is_none() && !active_shown_before && previous != active;
+        // The UI asked to keep focus (see `keep_ui_focus`): pages come on
+        // screen without taking it (including one still being built for the
+        // switch, shown by a later pass) until the UI calls `focus_page`.
+        if host.keep_ui_focus {
+            focus_page = None;
+        }
+        #[cfg(windows)]
+        Self::sync_clip_pages(&host, text_scale);
+        #[cfg(not(windows))]
+        let _ = text_scale;
         drop(host);
         if let Some(wv) = focus_page {
             let _ = wv.set_focus();
@@ -612,7 +710,7 @@ impl TabHost {
             let app = app.clone();
             crate::webview_win::capture(&wv, move |img| {
                 if let Some(img) = img {
-                    app.host.lock().previews.insert(id, img);
+                    app.previews.put(&id, img);
                 }
             });
         }
@@ -629,6 +727,25 @@ impl TabHost {
                 }
             }
         }
+    }
+
+    /// Puts a playing video of a tab just left into the mini player. The
+    /// browser now and then refuses while the page is being hidden: then it
+    /// tries once more, if the tab is still in the background.
+    #[cfg(windows)]
+    fn pip_on_leave(app: &Shared, id: String, wv: Webview) {
+        let app = app.clone();
+        crate::webview_win::media_eval(&wv.clone(), id.clone(), pip_enter_js(), true, move |ok| {
+            if ok == Some(serde_json::Value::Bool(true)) {
+                return;
+            }
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                if app.store.lock().active_tab_id.as_deref() != Some(id.as_str()) {
+                    crate::webview_win::media_eval(&wv, id, pip_enter_js(), true, |_| {});
+                }
+            });
+        });
     }
 
     /// Builds the active tab's webview, then reconciles again to show it. The
@@ -664,12 +781,20 @@ impl TabHost {
         };
         host.create_failures = 0;
         let _ = wv.hide();
+        // Test runs (SERICA_TEST_MUTE=1) never play sound; pages still
+        // report that they play audio, so media features work as usual.
+        #[cfg(windows)]
+        if std::env::var_os("SERICA_TEST_MUTE").is_some() {
+            crate::webview_win::set_muted(&wv, true);
+        }
         #[cfg(windows)]
         if (zoom - 1.0).abs() > 0.001 {
             crate::webview_win::set_zoom(&wv, zoom);
         }
         #[cfg(not(windows))]
         let _ = zoom;
+        #[cfg(windows)]
+        crate::webview_win::register_clip_window(&wv, host.clipper.clone());
         if let Some(old) = host.views.insert(id.to_string(), TabView { webview: wv, profile, shown: false, hidden_at: None }) {
             let _ = old.webview.close();
         }
@@ -752,19 +877,13 @@ impl TabHost {
         }
     }
 
-    /// Holes in logical px relative to the page view, plus the page's
-    /// logical width (the UI thread derives the pixel scale from it). Pure:
-    /// callers read the text size `z` before taking the host lock, and nothing
-    /// here locks or waits on anything else.
-    fn clip_rects(host: &TabHost, z: f64) -> crate::webview_win::Clip {
-        let Some(b) = host.bounds else { return crate::webview_win::Clip::default() };
-        let holes = host
-            .holes
-            .values()
-            .filter(|h| h.w > 0.5 && h.h > 0.5)
-            .map(|h| (h.x * z - b.x, h.y * z - b.y, (h.x + h.w) * z - b.x, (h.y + h.h) * z - b.y, h.r * z))
-            .collect();
-        crate::webview_win::Clip { holes, page_width: b.w }
+    /// Tells the clip worker which page windows are on screen and where the
+    /// page area is (holes are in window coordinates).
+    #[cfg(windows)]
+    fn sync_clip_pages(host: &TabHost, z: f64) -> u64 {
+        let pages = host.views.values().filter(|v| v.shown).map(|v| v.webview.label().to_string()).collect();
+        let origin = host.bounds.map(|b| (b.x, b.y)).unwrap_or((0.0, 0.0));
+        host.clipper.set_pages(pages, origin, z)
     }
 
     /// Applies the current holes to every page view on screen.
@@ -773,10 +892,7 @@ impl TabHost {
         {
             let z = app.store.lock().settings.text_scale;
             let host = app.host.lock();
-            let clip = Self::clip_rects(&host, z);
-            for v in host.views.values().filter(|v| v.shown) {
-                crate::webview_win::set_clip(&v.webview, clip.clone());
-            }
+            Self::sync_clip_pages(&host, z);
         }
         #[cfg(not(windows))]
         let _ = app;
@@ -788,53 +904,30 @@ impl TabHost {
     /// drops it once there.
     /// `lead_ms` runs the hole ahead of (or, negative, behind) the UI's own
     /// animation so the page never covers the moving edge.
+    /// Returns a sequence number to wait for with `wait_clip` (0 off Windows).
     #[allow(clippy::too_many_arguments)]
-    pub fn set_hole(app: &Shared, id: String, rect: Hole, from: Option<Hole>, ms: u32, ease: [f64; 4], remove: bool, lead_ms: f64) {
-        let (gen, current) = {
-            let mut host = app.host.lock();
-            let g = host.hole_gen.entry(id.clone()).or_insert(0);
-            *g += 1;
-            (*g, host.holes.get(&id).copied())
-        };
-        // A change mid-animation continues from where the hole is now.
-        let from = from.map(|f| current.unwrap_or(f));
-        let hole_id = id.clone();
-        let finish = move |app: &Shared| {
-            let mut host = app.host.lock();
-            if remove {
-                host.holes.remove(&id);
-            } else {
-                host.holes.insert(id.clone(), rect);
-            }
-            drop(host);
-            Self::apply_clips(app);
-        };
-        let Some(from) = from.filter(|_| ms > 0) else {
-            finish(app);
-            return;
-        };
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let start = std::time::Instant::now();
-            loop {
-                let t = ((start.elapsed().as_secs_f64() * 1000.0 + lead_ms) / ms as f64).max(0.0);
-                {
-                    let mut host = app.host.lock();
-                    if host.hole_gen.get(&hole_id) != Some(&gen) {
-                        return; // superseded
-                    }
-                    if t >= 1.0 {
-                        break;
-                    }
-                    host.holes.insert(hole_id.clone(), Hole::lerp(from, rect, cubic_bezier(ease, t)));
-                }
-                Self::apply_clips(&app);
-                tokio::time::sleep(std::time::Duration::from_millis(7)).await;
-            }
-            if app.host.lock().hole_gen.get(&hole_id) == Some(&gen) {
-                finish(&app);
-            }
-        });
+    pub fn set_hole(app: &Shared, id: String, rect: Hole, from: Option<Hole>, ms: u32, ease: [f64; 4], remove: bool, lead_ms: f64) -> u64 {
+        #[cfg(windows)]
+        {
+            let clipper = app.host.lock().clipper.clone();
+            clipper.set_hole(id, rect, from, ms, ease, remove, lead_ms)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (app, id, rect, from, ms, ease, remove, lead_ms);
+            0
+        }
+    }
+
+    /// Blocks until hole change `seq` is on screen (or `timeout` passes).
+    pub fn wait_clip(app: &Shared, seq: u64, timeout: std::time::Duration) {
+        #[cfg(windows)]
+        {
+            let clipper = app.host.lock().clipper.clone();
+            clipper.wait_applied(seq, timeout);
+        }
+        #[cfg(not(windows))]
+        let _ = (app, seq, timeout);
     }
 
     /// Keeps a profile's pages closed (`true`) or lets them back (`false`).
@@ -946,7 +1039,7 @@ impl TabHost {
             let app2 = app.clone();
             crate::webview_win::capture(&wv, move |img| {
                 if let Some(img) = img {
-                    app2.host.lock().previews.insert(tab_id, img);
+                    app2.previews.put(&tab_id, img);
                 }
             });
         });
@@ -956,6 +1049,21 @@ impl TabHost {
     pub fn apply_pdf_dark(app: &Shared) {
         for (tab_id, v) in app.host.lock().views.iter() {
             let _ = v.webview.eval(&pdf_dark_js(app.pdf_dark_for(tab_id)));
+        }
+    }
+
+    /// The UI is done keeping focus (see `keep_ui_focus`): pages take it as
+    /// usual again, and with `focus` the active page, if on screen, gets it now.
+    pub fn focus_page(app: &Shared, focus: bool) {
+        let active = app.store.lock().active_tab_id.clone();
+        let page = {
+            let mut host = app.host.lock();
+            host.keep_ui_focus = false;
+            let visible = host.visible;
+            active.as_ref().and_then(|id| host.views.get(id)).filter(|v| visible && v.shown).map(|v| v.webview.clone())
+        };
+        if let Some(wv) = page.filter(|_| focus) {
+            let _ = wv.set_focus();
         }
     }
 
@@ -996,18 +1104,30 @@ impl TabHost {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("unsupported url".into());
         }
-        let mut host = app.host.lock();
-        if let Some((wv, _)) = &host.assistant {
-            let _ = wv.navigate(parsed);
-            Self::apply_bounds(wv, b);
+        let profile = app.store.lock().active_profile_id();
+        // Read the open view's page outside the host lock: `url()` waits on
+        // the main thread, which may itself be waiting for that lock.
+        let open = app.host.lock().assistant.as_ref().map(|(w, _)| w.clone());
+        if let Some(wv) = open {
+            let current = wv.url().ok();
+            let mut host = app.host.lock();
+            if let Some(u) = &current {
+                host.assistant_remember(&profile, u);
+            }
+            // Reopening the same assistant: leave its page as it is.
+            if current.as_ref().and_then(|u| u.host_str()) != parsed.host_str() {
+                let _ = wv.navigate(host.assistant_resume(&profile, parsed));
+            }
+            Self::apply_bounds(&wv, b);
             let _ = wv.show();
-            host.assistant = Some((wv.clone(), b));
+            host.assistant = Some((wv, b));
             return Ok(());
         }
         let window = app.handle.get_window("main").ok_or("no window")?;
-        let profile = app.store.lock().active_profile_id();
+        let host = app.host.lock();
+        let target = host.assistant_resume(&profile, parsed);
         let label = format!("assistant-{}", LABEL_SEQ.fetch_add(1, Ordering::Relaxed));
-        let builder = host.builder(app, label, parsed, &profile, None);
+        let builder = host.builder(app, label, target, &profile, None);
         // Never hold the host lock across `add_child` (see `TabHost::build`).
         drop(host);
         let wv = window
@@ -1030,9 +1150,29 @@ impl TabHost {
     }
 
     pub fn assistant_close(app: &Shared) {
-        if let Some((wv, _)) = app.host.lock().assistant.take() {
-            let _ = wv.close();
+        let Some((wv, _)) = app.host.lock().assistant.take() else { return };
+        if let Ok(u) = wv.url() {
+            let profile = app.store.lock().active_profile_id();
+            app.host.lock().assistant_remember(&profile, &u);
         }
+        let _ = wv.close();
+    }
+
+    /// Notes the page an assistant is on, for `assistant_resume`.
+    fn assistant_remember(&mut self, profile: &str, u: &url::Url) {
+        if matches!(u.scheme(), "http" | "https") {
+            if let Some(h) = u.host_str() {
+                self.assistant_last.insert(format!("{profile} {h}"), u.clone());
+            }
+        }
+    }
+
+    /// The assistant's last page in this profile, else `url` (its home).
+    fn assistant_resume(&self, profile: &str, url: url::Url) -> url::Url {
+        url.host_str()
+            .and_then(|h| self.assistant_last.get(&format!("{profile} {h}")))
+            .cloned()
+            .unwrap_or(url)
     }
 
     pub fn assistant_webview(app: &Shared) -> Option<Webview> {

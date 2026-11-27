@@ -5,6 +5,34 @@ import { useElementHole } from '../hooks/useViewportOverlay';
 
 /** What changed in each version, shown once after Serica updates to it. */
 export const RELEASE_NOTES: Record<string, { title: string; text: string }[]> = {
+  '0.5.2': [
+    {
+      title: 'Smoother sidebar and swipes',
+      text: 'Swiping between spaces in the sidebar is smoother, swiping past the ends bounces gently, and consecutive swipes keep working without clicking first. Opening the sidebar no longer pulls down an auto-hidden top bar.',
+    },
+    {
+      title: 'Guides and window controls',
+      text: 'Tour guide cards stay clear of web pages as they move, the sidebar guide waits for the product tour to finish, and the window controls are clickable all the way to the top edge.',
+    },
+  ],
+  '0.5.1': [
+    {
+      title: 'Smoother with many tabs',
+      text: 'The sidebar, top bar and dock open at once, even while pages load or memory runs low, and switching tabs no longer hitches. Background tabs sleep sooner when memory gets tight.',
+    },
+    {
+      title: 'A mini player that keeps up',
+      text: 'Leaving a playing video moves it to picture-in-picture every time, on YouTube, YouTube Music and players embedded in course sites.',
+    },
+    {
+      title: 'Drag downloads anywhere, and reminders to update',
+      text: 'Drag a finished download to a folder, the desktop or a web page. A popup tells you when an update is ready, and can remind you later. The new tab can greet you again (Customize › Greeting).',
+    },
+    {
+      title: 'Back to your last chat',
+      text: 'The AI panel returns to your last chat when you switch assistants or reopen it. Small fixes can now arrive without reinstalling.',
+    },
+  ],
   '0.5.0': [
     {
       title: 'Focus Mode, with statistics',
